@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import logging
 import sys
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -36,167 +38,93 @@ logging.basicConfig(
 _LOGGER = logging.getLogger("cec-control-daemon")
 
 
-class AdapterUnavailable(RuntimeError):
-    """The CEC adapter cannot be used right now. Answered with HTTP 503."""
+# The driver lives with the integration, because that is where it is edited and
+# reviewed. Loading it by path rather than importing the package keeps the
+# daemon free of Home Assistant, which is not installed on the machine the
+# adapter is plugged into.
+_DRIVER_PATH = Path(__file__).resolve().parents[1] / (
+    "custom_components/cec_control/libcec_driver.py"
+)
+_spec = importlib.util.spec_from_file_location(
+    "cec_control_libcec_driver", _DRIVER_PATH
+)
+if _spec is None or _spec.loader is None:  # pragma: no cover - packaging error
+    raise RuntimeError(f"cannot load the libcec driver from {_DRIVER_PATH}")
+libcec_driver = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(libcec_driver)
+
+AdapterUnavailable = libcec_driver.DriverUnavailable
+CecRejected = libcec_driver.DriverError
 
 
 class CecAdapter:
     """Own the process-wide libcec adapter.
 
     libcec opens per process and only one process may hold a given adapter, so
-    this is a singleton by construction. All calls are serialised: libcec is
-    not safe to drive from several threads at once, and every request here is
-    short.
-
-    A ``cec.Device`` left alive at interpreter shutdown aborts the process
-    (``FATAL: exception not rethrown``, measured on libcec 7.0.0 with
-    python-cec 0.2.8). Every mapping obtained from ``list_devices`` is
-    therefore cleared before it can escape.
+    this is a singleton by construction. Calls are serialised because libcec is
+    not safe to drive from several threads at once, and each one is short.
     """
 
     def __init__(self, adapter: str | None = None) -> None:
         """Record which adapter to open on first use."""
         self._adapter = adapter
-        self._cec: Any = None
+        self._driver: Any = None
         self._lock = asyncio.Lock()
-        self._last_error = ""
 
     @property
     def adapter(self) -> str | None:
         """Return the configured adapter path, if one was given."""
         return self._adapter
 
-    @property
-    def last_error(self) -> str:
-        """Return why the adapter was last found unusable."""
-        return self._last_error
-
-    def _import(self) -> Any:
-        """Return the libcec bindings."""
-        try:
-            import cec
-        except ImportError as err:
-            raise AdapterUnavailable(
-                "libcec's Python bindings are missing; install libcec and "
-                "'pip install cec'"
-            ) from err
-        return cec
-
     def _open_sync(self) -> Any:
-        """Open the adapter, blocking."""
-        cec = self._import()
-        try:
-            if self._adapter:
-                cec.init(self._adapter)
-            else:
-                cec.init()
-        except Exception as err:
-            raise AdapterUnavailable(f"could not open CEC adapter: {err}") from err
-        return cec
+        """Create and open the driver, blocking."""
+        driver = libcec_driver.create_driver(self._adapter)
+        driver.open()
+        return driver
 
-    async def _ensure_open(self) -> Any:
-        """Open the adapter once, remembering failures for /health."""
-        if self._cec is not None:
-            return self._cec
-        loop = asyncio.get_running_loop()
-        try:
-            self._cec = await loop.run_in_executor(None, self._open_sync)
-        except AdapterUnavailable as err:
-            self._last_error = str(err)
-            raise
-        self._last_error = ""
-        return self._cec
-
-    async def _run(self, func: Any, *args: Any) -> Any:
-        """Run one blocking libcec call under the lock."""
+    async def _run(self, method: str, *args: Any) -> Any:
+        """Run one driver method in a thread, under the lock."""
         async with self._lock:
-            await self._ensure_open()
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, func, *args)
-
-    def _scan_sync(self) -> list[dict[str, Any]]:
-        """Poll every logical address, keeping no libcec objects afterwards."""
-        devices = self._cec.list_devices()
-        try:
-            return [
-                {
-                    "address": int(address),
-                    "osd_string": str(device.osd_string),
-                    "vendor": str(device.vendor),
-                    "physical_address": str(device.physical_address),
-                    "cec_version": str(device.cec_version),
-                    "is_on": bool(device.is_on()),
-                }
-                for address, device in sorted(devices.items())
-            ]
-        finally:
-            devices.clear()
-            del devices
+            if self._driver is None:
+                self._driver = await loop.run_in_executor(None, self._open_sync)
+            return await loop.run_in_executor(
+                None, getattr(self._driver, method), *args
+            )
 
     async def scan(self) -> list[dict[str, Any]]:
         """Return the devices currently answering on the bus."""
-        return await self._run(self._scan_sync)
-
-    def _transmit_sync(self, destination: int, opcode: int, params: bytes) -> bool:
-        """Send one raw message without creating a Device."""
-        return bool(self._cec.transmit(destination, opcode, params))
+        return await self._run("scan")
 
     async def transmit(self, destination: int, opcode: int, params: bytes) -> None:
         """Send one raw CEC message."""
-        if not await self._run(self._transmit_sync, destination, opcode, params):
+        if not await self._run("transmit", destination, opcode, params):
             raise CecRejected(
                 f"CEC rejected opcode 0x{opcode:02X} to address {destination}"
             )
 
-    def _power_sync(self, destination: int, turn_on: bool) -> bool:
-        """Power on via libcec, or send a plain standby."""
-        if not turn_on:
-            return bool(self._cec.transmit(destination, OPCODE_STANDBY, b""))
-        devices = self._cec.list_devices()
-        try:
-            device = devices.get(destination)
-            if device is None:
-                return False
-            return bool(device.power_on())
-        finally:
-            devices.clear()
-            del devices
-
     async def power(self, destination: int, turn_on: bool) -> None:
         """Power a device on, or put it into standby."""
-        if not await self._run(self._power_sync, destination, turn_on):
+        if not await self._run("power", destination, turn_on):
             raise CecRejected(
                 f"{'power on' if turn_on else 'standby'} to address "
                 f"{destination} was rejected"
             )
 
-    def _active_source_sync(self) -> bool:
-        """Declare this adapter the active source."""
-        return bool(self._cec.set_active_source())
-
     async def set_active_source(self) -> None:
         """Declare this adapter to be the active source."""
-        if not await self._run(self._active_source_sync):
+        if not await self._run("set_active_source"):
             raise CecRejected("setting the active source was rejected")
 
     async def health(self) -> dict[str, Any]:
         """Report whether the adapter is usable, without failing the request."""
         try:
-            await self._run(self._noop)
+            await self._run("scan")
         except AdapterUnavailable as err:
             return {"device_ok": False, "detail": str(err)}
+        except CecRejected as err:
+            return {"device_ok": False, "detail": str(err)}
         return {"device_ok": True, "detail": ""}
-
-    @staticmethod
-    def _noop() -> None:
-        """Do nothing; used to force the adapter open for a health check."""
-
-
-OPCODE_STANDBY = 0x36
-
-
-class CecRejected(RuntimeError):
-    """The adapter accepted the request but the bus did not acknowledge it."""
 
 
 def _json(status: int, payload: dict[str, Any]) -> web.Response:

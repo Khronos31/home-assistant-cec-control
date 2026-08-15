@@ -29,12 +29,15 @@ interchangeable: the entities cannot tell which is in use.
 
 | | When to use it |
 | --- | --- |
-| **Local adapter** | The adapter is plugged into the machine running Home Assistant. Uses libcec's Python bindings, which the Home Assistant OS image already provides. |
+| **Local adapter** | The adapter is plugged into the machine running Home Assistant. Uses libcec's Python bindings, which the Home Assistant OS image already provides — no extra requirements. |
 | **Daemon** | The adapter is plugged into some other machine — a Raspberry Pi next to the television, say. Run `daemon/cec_daemon.py` there; the integration reaches it over HTTP. |
 
 Neither is a bridge: nothing is translated between protocols, they are just two
 routes to the same CEC bus.
 
+> Only one process can hold a CEC adapter at a time, so the two are
+> alternatives rather than a fallback chain — you cannot run the daemon on the
+> machine that also has a local-adapter entry.
 ## Installing the integration
 
 Add this repository to HACS as a custom repository, or copy
@@ -75,9 +78,12 @@ every version representation in the repository agrees, and it runs in CI.
 ## Hardware notes
 
 What was measured against a Pulse-Eight USB-CEC adapter and the television in
-the author's study — including the key codes this television ignores, and a
-libcec quirk that will crash your process if you hold the wrong object — is in
-[`docs/cec-findings.md`](docs/cec-findings.md).
+the author's study is in [`docs/cec-findings.md`](docs/cec-findings.md). Read it
+before touching the driver — in particular, **two unrelated Python modules are
+both importable as `cec`**, and which one you get depends on the machine. The
+driver supports both and picks by feature detection. The same file records the
+key codes this television ignores, and a binding quirk that will abort your
+process at shutdown if you hold the wrong object.
 
 ## Credits
 

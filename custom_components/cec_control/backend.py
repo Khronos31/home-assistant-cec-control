@@ -25,9 +25,14 @@ import aiohttp
 from .const import (
     ADDRESS_TV,
     KEY_HOLD_SECONDS,
-    OPCODE_STANDBY,
     OPCODE_USER_CONTROL_PRESSED,
     OPCODE_USER_CONTROL_RELEASE,
+)
+from .libcec_driver import (
+    DriverError,
+    DriverUnavailable,
+    LibcecDriver,
+    create_driver,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -137,36 +142,12 @@ class CecBackend(ABC):
         await self.async_transmit(destination, OPCODE_USER_CONTROL_RELEASE, b"")
 
 
-def import_libcec() -> Any:
-    """Return the libcec Python bindings, or raise BackendUnavailable.
-
-    The bindings are a compiled extension that ships with the Home Assistant
-    image rather than through this integration's requirements, so an install
-    that only ever uses the daemon backend must not fail to load because they
-    are missing.
-    """
-    try:
-        import cec
-    except ImportError as err:  # pragma: no cover - depends on the host image
-        raise BackendUnavailable(
-            "libcec's Python bindings (the 'cec' module) are not available on "
-            "this Home Assistant installation; use the daemon backend instead"
-        ) from err
-    return cec
-
-
 class LocalBackend(CecBackend):
     """Drive an adapter attached to this machine through libcec.
 
-    Two properties of the bindings shape this class:
-
-    * ``cec.init()`` opens the adapter for the whole process, and the adapter
-      can only be held by one process at a time.
-    * A ``cec.Device`` object that is still alive when the interpreter shuts
-      down aborts the process (``FATAL: exception not rethrown``, measured on
-      libcec 7.0.0 with python-cec 0.2.8 on 2026-08-16). Every device mapping
-      obtained here is therefore cleared before returning, and only plain data
-      escapes this class.
+    All the binding-specific work lives in :mod:`libcec_driver`; this class only
+    moves it off the event loop and serialises it. libcec is not safe to drive
+    from several threads at once, and every call here is short.
     """
 
     def __init__(self, hass: Any, adapter: str | None = None) -> None:
@@ -174,129 +155,83 @@ class LocalBackend(CecBackend):
         self._hass = hass
         self._adapter = adapter
         self._lock = asyncio.Lock()
-        self._initialised = False
+        self._driver: LibcecDriver | None = None
 
     @property
     def label(self) -> str:
         """Return the adapter path."""
         return self._adapter or "auto-detected adapter"
 
-    def _init_sync(self) -> None:
-        """Open the adapter. Runs in an executor; libcec blocks."""
-        cec = import_libcec()
-        try:
-            if self._adapter:
-                cec.init(self._adapter)
-            else:
-                cec.init()
-        except Exception as err:
-            raise BackendUnavailable(f"could not open CEC adapter: {err}") from err
+    def _open_sync(self) -> LibcecDriver:
+        """Create and open the driver, blocking."""
+        driver = create_driver(self._adapter)
+        driver.open()
+        return driver
 
-    async def _async_ensure_init(self) -> None:
-        """Open the adapter once."""
-        if self._initialised:
-            return
-        await self._hass.async_add_executor_job(self._init_sync)
-        self._initialised = True
+    async def _async_driver(self) -> LibcecDriver:
+        """Return the open driver, opening it the first time."""
+        if self._driver is None:
+            self._driver = await self._hass.async_add_executor_job(self._open_sync)
+        return self._driver
 
-    def _scan_sync(self) -> BackendStatus:
-        """Poll the bus, keeping no libcec objects alive afterwards."""
-        cec = import_libcec()
-        devices = cec.list_devices()
-        try:
-            found = {
-                int(address): CecDevice(
-                    address=int(address),
-                    osd_string=str(device.osd_string),
-                    vendor=str(device.vendor),
-                    physical_address=str(device.physical_address),
-                    cec_version=str(device.cec_version),
-                    is_on=bool(device.is_on()),
+    async def _call(self, method: str, *args: Any) -> Any:
+        """Run one driver method in an executor, under the lock."""
+        async with self._lock:
+            driver = await self._async_driver()
+            try:
+                return await self._hass.async_add_executor_job(
+                    getattr(driver, method), *args
                 )
-                for address, device in devices.items()
-            }
-        finally:
-            # See the class docstring: these must not outlive this call.
-            devices.clear()
-            del devices
-        return BackendStatus(available=True, devices=found)
+            except DriverUnavailable as err:
+                raise BackendUnavailable(str(err)) from err
+            except DriverError as err:
+                raise BackendError(str(err)) from err
 
     async def async_scan(self) -> BackendStatus:
         """Poll the bus."""
-        async with self._lock:
-            await self._async_ensure_init()
-            try:
-                return await self._hass.async_add_executor_job(self._scan_sync)
-            except BackendError:
-                raise
-            except Exception as err:
-                raise BackendUnavailable(f"CEC bus scan failed: {err}") from err
-
-    def _transmit_sync(self, destination: int, opcode: int, params: bytes) -> None:
-        """Send one message through the module-level API.
-
-        Deliberately not ``Device.transmit``: the module-level call never
-        creates a ``cec.Device``, so it cannot contribute to the shutdown abort
-        described in the class docstring.
-        """
-        cec = import_libcec()
-        if not cec.transmit(destination, opcode, params):
-            raise BackendError(
-                f"CEC rejected opcode 0x{opcode:02X} to address {destination}"
-            )
+        entries = await self._call("scan")
+        return BackendStatus(
+            available=True,
+            devices={
+                int(entry["address"]): CecDevice.from_dict(entry) for entry in entries
+            },
+        )
 
     async def async_transmit(
         self, destination: int, opcode: int, params: bytes = b""
     ) -> None:
         """Send one raw CEC message."""
-        async with self._lock:
-            await self._async_ensure_init()
-            await self._hass.async_add_executor_job(
-                self._transmit_sync, destination, opcode, params
+        if not await self._call("transmit", destination, opcode, params):
+            raise BackendError(
+                f"CEC rejected opcode 0x{opcode:02X} to address {destination}"
             )
 
-    def _power_sync(self, destination: int, turn_on: bool) -> None:
-        """Power on through libcec, or send a plain standby."""
-        cec = import_libcec()
-        if not turn_on:
-            if not cec.transmit(destination, OPCODE_STANDBY, b""):
-                raise BackendError(f"standby to address {destination} was rejected")
-            return
-        # Powering on is more than one message on most televisions, so let
-        # libcec drive it. This is the one place a Device object is needed;
-        # it is dropped before returning.
-        devices = cec.list_devices()
-        try:
-            device = devices.get(destination)
-            if device is None:
-                raise BackendUnavailable(
-                    f"no device answered at CEC address {destination}"
-                )
-            if not device.power_on():
-                raise BackendError(f"power on to address {destination} was rejected")
-        finally:
-            devices.clear()
-            del devices
+    async def async_send_key(self, destination: int, key_code: int) -> None:
+        """Send one key, letting the binding do it natively where it can."""
+        if not await self._call("send_key", destination, key_code):
+            raise BackendError(
+                f"CEC rejected key 0x{key_code:02X} to address {destination}"
+            )
 
     async def async_power(self, destination: int, turn_on: bool) -> None:
         """Power a device on, or put it into standby."""
-        async with self._lock:
-            await self._async_ensure_init()
-            await self._hass.async_add_executor_job(
-                self._power_sync, destination, turn_on
+        if not await self._call("power", destination, turn_on):
+            raise BackendError(
+                f"{'power on' if turn_on else 'standby'} to address "
+                f"{destination} was rejected"
             )
-
-    def _active_source_sync(self) -> None:
-        """Declare this adapter the active source."""
-        cec = import_libcec()
-        if not cec.set_active_source():
-            raise BackendError("setting the active source was rejected")
 
     async def async_set_active_source(self) -> None:
         """Declare this adapter to be the active source."""
+        if not await self._call("set_active_source"):
+            raise BackendError("setting the active source was rejected")
+
+    async def async_close(self) -> None:
+        """Release the adapter."""
         async with self._lock:
-            await self._async_ensure_init()
-            await self._hass.async_add_executor_job(self._active_source_sync)
+            driver, self._driver = self._driver, None
+            if driver is not None:
+                await self._hass.async_add_executor_job(driver.close)
 
 
 class DaemonBackend(CecBackend):

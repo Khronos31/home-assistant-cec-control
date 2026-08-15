@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import voluptuous as vol
@@ -19,7 +20,7 @@ from homeassistant.helpers.selector import (
     TextSelector,
 )
 
-from .backend import BackendError, BackendUnavailable, DaemonBackend, import_libcec
+from .backend import BackendError, BackendUnavailable, DaemonBackend
 from .const import (
     ADDRESS_TV,
     BACKEND_DAEMON,
@@ -30,24 +31,34 @@ from .const import (
     DEFAULT_DAEMON_PORT,
     DOMAIN,
 )
+from .libcec_driver import detect_adapters
+
+_LOGGER = logging.getLogger(__name__)
 
 _ADAPTER_MANUAL = "__manual__"
 
 
 def _list_adapters_sync() -> list[str]:
     """Return the CEC adapters attached to this machine."""
-    cec = import_libcec()
-    return [str(path) for path in cec.list_adapters()]
+    return detect_adapters()
 
 
-async def async_list_adapters(hass: HomeAssistant) -> list[str]:
-    """Return locally attached adapters, or an empty list if libcec is absent."""
+async def async_discover_adapters(hass: HomeAssistant) -> tuple[list[str], str]:
+    """Return locally attached adapters, and why the list is empty if it is.
+
+    Discovery failing must not break the flow — entering a path by hand still
+    works, and the daemon backend does not need libcec here at all. But it must
+    not fail *silently* either: "no adapters found" and "libcec is not installed"
+    send someone looking in completely different places.
+    """
     try:
-        return await hass.async_add_executor_job(_list_adapters_sync)
-    except BackendError:
-        return []
-    except Exception:
-        return []
+        return await hass.async_add_executor_job(_list_adapters_sync), ""
+    except BackendError as err:
+        _LOGGER.warning("CEC adapter discovery unavailable: %s", err)
+        return [], str(err)
+    except Exception as err:
+        _LOGGER.exception("CEC adapter discovery failed")
+        return [], f"{type(err).__name__}: {err}"
 
 
 class CecControlConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -68,7 +79,7 @@ class CecControlConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Configure an adapter attached to this machine."""
         errors: dict[str, str] = {}
-        adapters = await async_list_adapters(self.hass)
+        adapters, discovery_problem = await async_discover_adapters(self.hass)
 
         if user_input is not None:
             adapter = str(user_input.get(CONF_ADAPTER) or "").strip()
@@ -110,7 +121,9 @@ class CecControlConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=schema,
             errors=errors,
             description_placeholders={
-                "found": ", ".join(adapters) if adapters else "none"
+                "found": ", ".join(adapters)
+                if adapters
+                else (discovery_problem or "none")
             },
         )
 
