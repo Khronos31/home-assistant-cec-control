@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version without a v prefix (for example, 0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cec-control-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      # Every file scripts/version.py is allowed to rewrite. Anything else
+      # changing during synchronization means the script did something
+      # unintended, and the release stops.
+      VERSIONED_FILES: >-
+        ^(README\.md|VERSION|custom_components/cec_control/manifest\.json|daemon/cec_daemon\.py)$
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Verify the dispatch source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release must be dispatched from main, not $GITHUB_REF" >&2
+            exit 1
+          fi
+          git fetch --force origin main --tags
+          if [[ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]]; then
+            echo "origin/main changed after this workflow was dispatched" >&2
+            exit 1
+          fi
+
+      - name: Install validation dependencies
+        run: python -m pip install -r requirements-test.txt
+
+      - name: Synchronize the release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_version="$(python scripts/version.py check)"
+          if [[ "$RELEASE_VERSION" != "$current_version" ]]; then
+            python scripts/version.py newer "$RELEASE_VERSION" "$current_version"
+          fi
+          python scripts/version.py sync "$RELEASE_VERSION"
+          python scripts/version.py check
+          unexpected="$({ git diff --name-only; git ls-files --others --exclude-standard; } \
+            | sort -u \
+            | grep -Ev "$VERSIONED_FILES" \
+            || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "Version synchronization changed unexpected files:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+
+      - name: Validate the release tree
+        run: ./scripts/validate.sh
+
+      - name: Prepare or recover the release tag
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' \
+            --sort=-version:refname \
+            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | head -n 1 || true)"
+
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "$tag")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "$tag already exists on a different commit" >&2
+              exit 1
+            fi
+            if [[ "$latest_tag" != "$tag" ]]; then
+              echo "$tag is not the latest stable tag" >&2
+              exit 1
+            fi
+            if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+              echo "Existing tag recovery requires an already synchronized tree" >&2
+              exit 1
+            fi
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -n "$latest_tag" ]]; then
+            python scripts/version.py newer "$RELEASE_VERSION" "${latest_tag#v}"
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release exists without a fetched matching tag: $tag" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git add README.md VERSION \
+              custom_components/cec_control/manifest.json \
+              daemon/cec_daemon.py
+            git commit -m "Release $tag"
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+            echo "Release tree is not clean after the version commit" >&2
+            exit 1
+          fi
+
+          git tag -a "$tag" -m "Release $tag"
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]]; then
+            echo "origin/main changed during release validation" >&2
+            exit 1
+          fi
+          gh auth setup-git --hostname github.com
+          git push --atomic origin "HEAD:refs/heads/main" "refs/tags/$tag"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the GitHub Release
+        if: steps.prepare.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: >-
+          gh release create "$RELEASE_TAG"
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --generate-notes
+          --title "$RELEASE_TAG"
+
+      - name: Verify the published Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          release="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')"
+          if [[ "$release" != "$RELEASE_TAG"$'\t'false$'\t'false ]]; then
+            echo "Published release did not match the requested stable tag" >&2
+            exit 1
+          fi

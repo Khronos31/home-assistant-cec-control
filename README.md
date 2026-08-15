@@ -79,7 +79,9 @@ The integration and the daemon are released together under a single version and
 a single tag. The daemon reports its version from `GET /health`, so an
 integration talking to a daemon left behind by an upgrade is a detectable
 condition rather than a confusing bug. `scripts/version.py check` enforces that
-every version representation in the repository agrees, and it runs in CI.
+every version representation in the repository agrees; it runs in CI alongside
+Home Assistant's `hassfest` and the HACS action, and the whole arrangement is
+written down in [`docs/release-contract.md`](docs/release-contract.md).
 
 ## Hardware notes
 

@@ -3,29 +3,38 @@ name: Validate
 on:
   push:
   pull_request:
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  validate:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
+          cache: pip
+      - run: python -m pip install -r requirements-test.txt
+      - run: ./scripts/validate.sh
 
-      - name: Install test dependencies
-        run: pip install -r requirements-test.txt
+  hassfest:
+    # Home Assistant's own manifest and integration checks. Neither libcec nor
+    # a CEC adapter is needed: this validates the integration's declarations,
+    # not its behaviour.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: home-assistant/actions/hassfest@a7c616ce81ccda50150bf1595786c71b1883fabb
 
-      - name: Check that every version representation agrees
-        run: python scripts/version.py check
-
-      - name: Run the test suite
-        run: python -m pytest -q
-
-      - name: Byte-compile both products
-        run: python -m compileall -q custom_components daemon scripts tests
-
-      - name: Lint
-        run: python -m ruff check custom_components daemon scripts tests
+  hacs:
+    # HACS installs by tag and reads the version out of manifest.json, so this
+    # is what makes "one version for both halves" mean something to a user
+    # rather than only to scripts/version.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # 22.5.0
+        with:
+          category: integration
