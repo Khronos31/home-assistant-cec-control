@@ -21,6 +21,17 @@ from custom_components.cec_control.libcec_driver import (
 )
 
 
+class FakeAddressList:
+    """Stands in for cec.cec_logical_addresses."""
+
+    def __init__(self) -> None:
+        self.cleared = False
+
+    def Clear(self) -> None:
+        """Record the clear."""
+        self.cleared = True
+
+
 class FakeSwigConfig:
     """Stands in for cec.libcec_configuration."""
 
@@ -28,6 +39,12 @@ class FakeSwigConfig:
         self.strDeviceName = ""
         self.deviceTypes = self
         self.added: list[int] = []
+        # libcec populates these with the television by default.
+        self.wakeDevices = FakeAddressList()
+        self.powerOffDevices = FakeAddressList()
+        self.bAutoWakeAVR = 1
+        self.bPowerOffOnStandby = 1
+        self.bActivateSource = 1
 
     def Clear(self) -> None:
         """Reset, as libcec requires before use."""
@@ -273,6 +290,22 @@ def test_swig_device_name_fits_libcecs_field() -> None:
     module = FakeSwigModule()
     SwigDriver(module).detect_adapters()
     assert len(module.config.strDeviceName) < 13
+
+
+def test_swig_does_not_let_libcec_wake_the_television() -> None:
+    """libcec wakes the TV on connect by default.
+
+    For a media player that is reasonable. For an integration it means the
+    television switches on every time Home Assistant restarts — which is what
+    happened before this was cleared.
+    """
+    module = FakeSwigModule()
+    SwigDriver(module).detect_adapters()
+    assert module.config.wakeDevices.cleared
+    assert module.config.powerOffDevices.cleared
+    assert module.config.bActivateSource == 0
+    assert module.config.bAutoWakeAVR == 0
+    assert module.config.bPowerOffOnStandby == 0
 
 
 def test_swig_open_accepts_a_ping_when_open_reports_failure() -> None:

@@ -150,6 +150,17 @@ class SwigDriver(LibcecDriver):
         config.clientVersion = cec.LIBCEC_VERSION_CURRENT
         # Do not steal the picture just by connecting.
         config.bActivateSource = 0
+        # libcec's default configuration wakes the television when it connects
+        # and stands it by when it disconnects. That is reasonable for a media
+        # player; it is wrong for an integration, which would switch the set on
+        # every time Home Assistant restarts. Measured on 2026-08-16: without
+        # this, a restart turned the study television on.
+        for devices in (config.wakeDevices, config.powerOffDevices):
+            clear = getattr(devices, "Clear", None)
+            if clear is not None:
+                clear()
+        config.bAutoWakeAVR = 0
+        config.bPowerOffOnStandby = 0
         config.deviceTypes.Add(cec.CEC_DEVICE_TYPE_RECORDING_DEVICE)
         lib = cec.ICECAdapter.Create(config)
         if lib is None:
