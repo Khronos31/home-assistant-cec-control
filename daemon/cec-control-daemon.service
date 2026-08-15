@@ -1,0 +1,16 @@
+[Unit]
+Description=CEC Control daemon (HDMI-CEC over HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to the user and checkout path on the machine holding the adapter.
+User=pi
+WorkingDirectory=/home/pi/home-assistant-cec-control
+ExecStart=/usr/bin/python3 /home/pi/home-assistant-cec-control/daemon/cec_daemon.py --port 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

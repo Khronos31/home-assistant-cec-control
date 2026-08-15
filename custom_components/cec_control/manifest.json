@@ -1,0 +1,14 @@
+{
+  "domain": "cec_control",
+  "name": "CEC Control",
+  "codeowners": [
+    "@Khronos31"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/Khronos31/home-assistant-cec-control",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Khronos31/home-assistant-cec-control/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

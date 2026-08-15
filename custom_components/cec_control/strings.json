@@ -1,0 +1,49 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "CEC Control",
+        "description": "Where is the CEC adapter?",
+        "menu_options": {
+          "local": "Attached to this machine",
+          "daemon": "Attached to another machine (CEC Control daemon)"
+        }
+      },
+      "local": {
+        "title": "Local CEC adapter",
+        "description": "Adapters found: {found}",
+        "data": {
+          "adapter": "Adapter",
+          "manual_adapter": "Adapter path (only if entering one manually)",
+          "device_address": "CEC logical address to control (0 is the TV)"
+        }
+      },
+      "daemon": {
+        "title": "Remote CEC adapter",
+        "description": "The host running this repository's daemon.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "device_address": "CEC logical address to control (0 is the TV)"
+        }
+      }
+    },
+    "error": {
+      "adapter_required": "Choose an adapter, or enter a path manually.",
+      "cannot_connect": "Could not reach the daemon at that address.",
+      "not_a_daemon": "Something answered, but it is not a CEC Control daemon.",
+      "adapter_unavailable": "The daemon is running but its CEC adapter is not usable.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "That adapter is already set up."
+    }
+  },
+  "entity": {
+    "remote": {
+      "remote": {
+        "name": "Remote"
+      }
+    }
+  }
+}

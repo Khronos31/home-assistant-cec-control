@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+htmlcov/
+
+# Local credentials and captured device data must never be committed.
+credentials/
+fixtures/private/
+*.secret.json
+*.qr.png
