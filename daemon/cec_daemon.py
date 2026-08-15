@@ -70,6 +70,7 @@ class CecAdapter:
         self._adapter = adapter
         self._driver: Any = None
         self._lock = asyncio.Lock()
+        self._guard = libcec_driver.OpenGuard()
 
     @property
     def adapter(self) -> str | None:
@@ -82,15 +83,32 @@ class CecAdapter:
         driver.open()
         return driver
 
+    async def _ensure_open(self) -> Any:
+        """Open the adapter once, bounding how long we wait for it."""
+        if self._driver is not None:
+            return self._driver
+        blocked = self._guard.blocked()
+        if blocked:
+            raise AdapterUnavailable(blocked)
+        loop = asyncio.get_running_loop()
+        try:
+            self._driver = await asyncio.wait_for(
+                loop.run_in_executor(None, self._open_sync),
+                timeout=libcec_driver.OPEN_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            message = libcec_driver.adapter_busy_message(self._adapter)
+            self._guard.record_failure(message)
+            raise AdapterUnavailable(message) from None
+        self._guard.record_success()
+        return self._driver
+
     async def _run(self, method: str, *args: Any) -> Any:
         """Run one driver method in a thread, under the lock."""
         async with self._lock:
+            driver = await self._ensure_open()
             loop = asyncio.get_running_loop()
-            if self._driver is None:
-                self._driver = await loop.run_in_executor(None, self._open_sync)
-            return await loop.run_in_executor(
-                None, getattr(self._driver, method), *args
-            )
+            return await loop.run_in_executor(None, getattr(driver, method), *args)
 
     async def scan(self) -> list[dict[str, Any]]:
         """Return the devices currently answering on the bus."""

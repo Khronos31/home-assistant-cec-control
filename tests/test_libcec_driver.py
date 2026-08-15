@@ -11,14 +11,21 @@ from __future__ import annotations
 
 import pytest
 
+from custom_components.cec_control import libcec_driver
 from custom_components.cec_control.libcec_driver import (
     DriverUnavailable,
+    OpenGuard,
     PythonCecDriver,
     SwigDriver,
+    adapter_busy_message,
     create_driver,
     flavour,
     format_physical_address,
 )
+
+# A path nothing can hold, so the flock pre-flight stays out of the way and these
+# tests do not depend on what happens to be plugged into the machine.
+FAKE_ADAPTER = "/dev/fake-cec-adapter"
 
 
 class FakeAddressList:
@@ -311,7 +318,7 @@ def test_swig_does_not_let_libcec_wake_the_television() -> None:
 def test_swig_open_accepts_a_ping_when_open_reports_failure() -> None:
     """libcec reports failure on adapters that work; a ping settles it."""
     lib = FakeLib(open_ok=False, ping_ok=True)
-    driver = SwigDriver(FakeSwigModule(lib), "/dev/ttyACM0")
+    driver = SwigDriver(FakeSwigModule(lib), FAKE_ADAPTER)
     driver.open()
     assert not lib.closed
 
@@ -319,7 +326,7 @@ def test_swig_open_accepts_a_ping_when_open_reports_failure() -> None:
 def test_swig_open_gives_up_when_the_adapter_never_answers() -> None:
     """A genuinely absent adapter must fail rather than retry forever."""
     lib = FakeLib(open_ok=False, ping_ok=False)
-    driver = SwigDriver(FakeSwigModule(lib), "/dev/ttyACM0")
+    driver = SwigDriver(FakeSwigModule(lib), FAKE_ADAPTER)
     with pytest.raises(DriverUnavailable, match="could not open"):
         driver.open()
     assert lib.closed
@@ -328,7 +335,7 @@ def test_swig_open_gives_up_when_the_adapter_never_answers() -> None:
 def test_swig_sends_keys_natively_rather_than_by_hand() -> None:
     """libcec handles the press/release timing better than we would."""
     lib = FakeLib()
-    driver = SwigDriver(FakeSwigModule(lib), "/dev/ttyACM0")
+    driver = SwigDriver(FakeSwigModule(lib), FAKE_ADAPTER)
     driver.open()
     assert driver.send_key(0, 0x53)
     assert ("SendKeypress", 0, 0x53) in lib.calls
@@ -338,7 +345,7 @@ def test_swig_sends_keys_natively_rather_than_by_hand() -> None:
 def test_swig_raw_transmit_builds_a_cec_client_style_frame() -> None:
     """The frame names our own logical address as the initiator."""
     lib = FakeLib()
-    driver = SwigDriver(FakeSwigModule(lib), "/dev/ttyACM0")
+    driver = SwigDriver(FakeSwigModule(lib), FAKE_ADAPTER)
     driver.open()
     driver.transmit(0x0F, 0x82, b"\x10\x00")
     assert ("Transmit", "1F:82:10:00") in lib.calls
@@ -346,7 +353,7 @@ def test_swig_raw_transmit_builds_a_cec_client_style_frame() -> None:
 
 def test_swig_scan_reports_only_devices_that_answered() -> None:
     """An address nobody holds must not appear as a device."""
-    driver = SwigDriver(FakeSwigModule(), "/dev/ttyACM0")
+    driver = SwigDriver(FakeSwigModule(), FAKE_ADAPTER)
     driver.open()
     devices = driver.scan()
     assert [device["address"] for device in devices] == [0]
@@ -358,7 +365,7 @@ def test_swig_scan_reports_only_devices_that_answered() -> None:
 def test_python_cec_scan_clears_every_device_mapping() -> None:
     """A surviving Device aborts the process at shutdown. This is the guard."""
     module = FakePythonCecModule()
-    driver = PythonCecDriver(module, "/dev/ttyACM0")
+    driver = PythonCecDriver(module, FAKE_ADAPTER)
     driver.open()
     driver.scan()
     assert module.mappings
@@ -368,7 +375,7 @@ def test_python_cec_scan_clears_every_device_mapping() -> None:
 def test_python_cec_power_on_clears_its_mapping_too() -> None:
     """power_on is the one place a Device is unavoidable; it still goes."""
     module = FakePythonCecModule()
-    driver = PythonCecDriver(module, "/dev/ttyACM0")
+    driver = PythonCecDriver(module, FAKE_ADAPTER)
     driver.open()
     assert driver.power(0, True)
     assert all(mapping.cleared for mapping in module.mappings)
@@ -377,7 +384,7 @@ def test_python_cec_power_on_clears_its_mapping_too() -> None:
 def test_python_cec_standby_creates_no_device_at_all() -> None:
     """Standby is a plain opcode, so it need not touch list_devices."""
     module = FakePythonCecModule()
-    driver = PythonCecDriver(module, "/dev/ttyACM0")
+    driver = PythonCecDriver(module, FAKE_ADAPTER)
     driver.open()
     assert driver.power(0, False)
     assert not module.mappings
@@ -387,8 +394,64 @@ def test_python_cec_standby_creates_no_device_at_all() -> None:
 def test_python_cec_sends_keys_as_press_and_release() -> None:
     """Without native key support, the two messages are built by hand."""
     module = FakePythonCecModule()
-    driver = PythonCecDriver(module, "/dev/ttyACM0")
+    driver = PythonCecDriver(module, FAKE_ADAPTER)
     driver.open()
     assert driver.send_key(0, 0x53, hold=0)
     opcodes = [call[2] for call in module.calls if call[0] == "transmit"]
     assert opcodes == [0x44, 0x45]
+
+
+def test_open_guard_reports_the_recorded_failure_during_its_cooldown() -> None:
+    """A timed-out open leaves a thread stuck in libcec, so retrying at once
+    would leak another one and still fail."""
+    guard = OpenGuard(cooldown=1000)
+    assert guard.blocked() == ""
+    guard.record_failure("adapter is held by another process")
+    assert guard.blocked() == "adapter is held by another process"
+
+
+def test_open_guard_lets_a_later_attempt_through() -> None:
+    """Whatever held the adapter may have gone away, so do not block forever."""
+    guard = OpenGuard(cooldown=0)
+    guard.record_failure("busy")
+    assert guard.blocked() == ""
+
+
+def test_open_guard_forgets_a_failure_once_the_adapter_opens() -> None:
+    """A success must not stay shadowed by an earlier timeout."""
+    guard = OpenGuard(cooldown=1000)
+    guard.record_failure("busy")
+    guard.record_success()
+    assert guard.blocked() == ""
+
+
+def test_busy_message_names_the_adapter_and_the_real_cause() -> None:
+    """The message is what a user sees in the config flow; it must point
+    somewhere useful."""
+    message = adapter_busy_message("/dev/ttyACM0")
+    assert "/dev/ttyACM0" in message
+    assert "one at a time" in message
+
+
+def test_both_drivers_refuse_an_adapter_another_process_holds(monkeypatch) -> None:
+    """Calling libcec here would freeze the interpreter rather than fail, so
+    the conflict has to be caught before either binding is touched."""
+    monkeypatch.setattr(libcec_driver, "adapter_is_held", lambda path: True)
+    for driver in (
+        SwigDriver(FakeSwigModule(), FAKE_ADAPTER),
+        PythonCecDriver(FakePythonCecModule(), FAKE_ADAPTER),
+    ):
+        with pytest.raises(DriverUnavailable, match="already held"):
+            driver.open()
+
+
+def test_an_adapter_nobody_holds_opens_normally(monkeypatch) -> None:
+    """The check must not block the ordinary case."""
+    monkeypatch.setattr(libcec_driver, "adapter_is_held", lambda path: False)
+    driver = PythonCecDriver(FakePythonCecModule(), FAKE_ADAPTER)
+    driver.open()
+
+
+def test_a_missing_device_is_left_for_libcec_to_report() -> None:
+    """A path that cannot be opened is not the same as one that is held."""
+    assert libcec_driver.adapter_is_held("/dev/definitely-not-a-cec-adapter") is False

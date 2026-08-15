@@ -96,27 +96,80 @@ Assistant, a crash during restart, at the least convenient possible moment.
 ## Keys
 
 The table in `custom_components/cec_control/keymap.py` came from
-`lua-remote-hub`, where it had been verified against this same television.
-`guide`, `return` and `screen_display` were re-checked here and are
-acknowledged, both as raw `USER_CONTROL_PRESSED` frames and through libcec's
-`SendKeypress`.
+`lua-remote-hub`, where it had been verified against this same television. All
+of it was re-sent here on 2026-08-16 — cursor, menus, all ten digits, channel,
+input, volume, mute, transport, the colour buttons and `data` — through libcec's
+`SendKeypress`, and every one was acknowledged. Read the next section before
+taking that as a stronger result than it is.
 
 `lua-remote-hub` also records keys this television **ignores**, which is the
 more valuable half of that file — they are carried over into `UNSUPPORTED_KEYS`
 rather than deleted, so nobody rediscovers them:
 
-`power` (toggle — the set only honours the discrete `power_on` / `power_off`),
-`mode_digital`, `mode_bs`, `mode_cs`, `menu`, `exit`, `program_info`,
+`power` (toggle), `mode_digital`, `mode_bs`, `mode_cs`, `menu`, `exit`, `program_info`,
 `subtitle`, `audio_select`, `back_10s`, `skip_30s`.
+
+## Acknowledged is not the same as acted on
+
+Every key in `keymap.py` was sent to this television on 2026-08-16 and all of
+them were acknowledged. That is a weaker statement than it sounds: a CEC ACK
+means the frame arrived and was addressed correctly, not that the set did
+anything with it.
+
+The clearest demonstration is the discrete power keys. `power_off`
+(`USER_CONTROL` 0x6C) is **acknowledged and then ignored** — the television was
+still reporting itself as on 28 seconds later. `media_player.turn_off`, which
+sends the `STANDBY` opcode (0x36) instead, switches it off in about eight
+seconds. So `power_on` / `power_off` remain in the key table because they are
+valid CEC codes that other sets do honour, but on this television the opcode
+path is the one that works, and that is what the media player uses.
+
+Read the sweep as "no key in the table produces a protocol error", not as "every
+key does something".
+
+## Keys sent too soon after power-on are dropped
+
+The first key sent about four seconds after `turn_on` was refused
+(`CEC rejected key 0x00`); the same key sent once the set had finished waking
+was accepted. The power status flips to on within a second, so it is not a
+reliable signal that the television is ready for user-control messages. An
+automation that powers the set on and immediately sends a key should expect to
+retry.
 
 ## One adapter, one process
 
 libcec opens the adapter for the whole process, and only one process may hold a
-given adapter at a time. Running the daemon on the same machine as a
-local-backend config entry will not work — whichever starts second cannot open
-the device. This is a constraint of the hardware, not of this code, and it is
-why the two transports are alternatives rather than a fallback chain. Switching
-between them means removing one config entry before adding the other.
+given adapter at a time. The two transports are therefore alternatives rather
+than a fallback chain: switching between them means removing one config entry
+before adding the other.
+
+**What happens when you get this wrong is worse than a failure.** Measured on
+2026-08-16, with Home Assistant holding the adapter and the daemon started
+against the same device:
+
+| | Before the fix | After |
+| --- | --- | --- |
+| `GET /health` | never answered | 200, `device_ok: false`, 13 ms |
+| `POST /transmit` | never answered | 503 with the reason, 5 ms |
+| `GET /nope` (touches no CEC) | never answered | 404, 1 ms |
+| `SIGTERM` | ignored | honoured |
+
+python-cec's `cec.init()` does not return when the adapter is taken — it blocks
+**while holding the GIL**, so the interpreter stops running Python entirely.
+That is why every endpoint died, not just the CEC ones, and why the process
+needed `SIGKILL`. No timeout written in Python can help: `asyncio.wait_for`
+never gets a chance to fire.
+
+The fix is to detect the conflict before libcec is called. libcec takes an
+exclusive `flock` on the device, so asking for the same lock non-blockingly
+answers the question — and it works across container boundaries, where scanning
+`/proc` does not, because the lock lives in the kernel and the process table
+does not. See `adapter_is_held()` in `libcec_driver.py`.
+
+The check is advisory: a holder that does not take the lock is invisible to it,
+it needs an explicitly configured device path, and there is a race between the
+check and `init()`. It converts the common accident from a freeze into a
+sentence, which is what it is for.
 
 ## Environment note
 

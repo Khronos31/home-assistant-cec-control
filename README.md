@@ -6,6 +6,12 @@ Home Assistant.
 
 Current version: **0.1.0**.
 
+## Status
+
+I no longer use this myself, so it will not pick up updates on its own. That is
+not the same as abandoned: if you are using it and something goes wrong, open an
+issue and tell me — I will be glad to respond.
+
 Home Assistant already ships an `hdmi_cec` integration. This one exists because
 that integration is YAML-only, has no config flow, and exposes little of what
 CEC can actually do. `cec_control` is a separate integration with its own

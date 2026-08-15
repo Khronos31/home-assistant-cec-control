@@ -72,7 +72,9 @@ KEY_CODES: Final[MappingProxyType[str, int]] = MappingProxyType(
         "yellow": 0x74,
         "data": 0x76,
         # Discrete power. A real remote only has a toggle; these two are CEC
-        # only, which is precisely why they are worth having.
+        # only. Note that the television in this house acknowledges them and
+        # then ignores them — the media player powers off with the STANDBY
+        # opcode instead. They stay here because other sets do honour them.
         "power_on": 0x6D,
         "power_off": 0x6C,
     }
@@ -82,7 +84,7 @@ KEY_CODES: Final[MappingProxyType[str, int]] = MappingProxyType(
 # documentation; sending them is allowed through the raw service but they are
 # not offered as named keys.
 UNSUPPORTED_KEYS: Final[tuple[str, ...]] = (
-    "power",  # toggle; the TV only honours the discrete power_on/power_off
+    "power",  # toggle; not honoured here, and neither are the discrete two
     "mode_digital",
     "mode_bs",
     "mode_cs",

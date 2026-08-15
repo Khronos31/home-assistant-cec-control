@@ -22,7 +22,10 @@ imports, so the daemon can load it directly from this file.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -40,6 +43,16 @@ OPEN_ATTEMPTS = 3
 OPEN_TIMEOUT_MS = 10_000
 OPEN_RETRY_SECONDS = 1.0
 
+# How long a caller should wait for the adapter to open before giving up.
+#
+# Measured on 2026-08-16: python-cec's cec.init() does not fail when another
+# process already holds the adapter — it blocks forever. The call is inside a C
+# extension and cannot be cancelled, so the thread running it is lost. Callers
+# therefore bound their own wait and must not start a new attempt immediately,
+# or every retry leaks another stuck thread.
+OPEN_WAIT_SECONDS = 20.0
+OPEN_COOLDOWN_SECONDS = 60.0
+
 # libcec's configuration struct declares strDeviceName as char[13], and SWIG
 # rejects anything longer outright rather than truncating. This is the name the
 # television shows in its own device list.
@@ -56,6 +69,94 @@ class DriverError(Exception):
 
 class DriverUnavailable(DriverError):
     """No usable adapter. The caller did nothing wrong."""
+
+
+def adapter_is_held(path: str) -> bool:
+    """Return whether another process already holds this adapter.
+
+    Why this exists: python-cec's ``cec.init()`` does not fail when the adapter
+    is taken — it blocks **while holding the GIL**, which freezes the whole
+    interpreter. Measured on 2026-08-16: the daemon stopped answering every
+    request, including ones that never touch CEC, and did not die on SIGTERM.
+    No timeout written in Python can rescue that, so the conflict has to be
+    detected before libcec is called at all.
+
+    libcec takes an exclusive ``flock`` on the device, so asking for the same
+    lock non-blockingly answers the question. The check works across container
+    boundaries, where scanning ``/proc`` does not — the lock lives in the
+    kernel, the process table does not.
+
+    Advisory only: a holder that does not take the lock is invisible here, and
+    a race between this check and ``init()`` is possible. It converts the
+    common accident from a freeze into a message, which is what it is for.
+    """
+    try:
+        handle = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        # Missing or unreadable: let libcec produce the real error.
+        return False
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
+        return err.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK)
+    else:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(handle)
+
+
+class OpenGuard:
+    """Decides whether another attempt to open the adapter is worth making.
+
+    An open that timed out left a thread stuck inside libcec forever, so
+    retrying immediately would leak one more thread each time and never
+    succeed anyway — nothing releases the adapter on our behalf. After a
+    timeout this reports the same failure straight away for a cooldown, which
+    also keeps ``/health`` answering promptly instead of hanging again.
+    """
+
+    def __init__(self, cooldown: float = OPEN_COOLDOWN_SECONDS) -> None:
+        """Start with no recorded failure."""
+        self._cooldown = cooldown
+        self._failed_at: float | None = None
+        self._reason = ""
+
+    def blocked(self) -> str:
+        """Return why an attempt should be skipped, or an empty string."""
+        if self._failed_at is None:
+            return ""
+        if time.monotonic() - self._failed_at >= self._cooldown:
+            self._failed_at = None
+            return ""
+        return self._reason
+
+    def record_failure(self, reason: str) -> None:
+        """Remember that opening timed out."""
+        self._failed_at = time.monotonic()
+        self._reason = reason
+
+    def record_success(self) -> None:
+        """Forget any earlier failure."""
+        self._failed_at = None
+        self._reason = ""
+
+
+def held_by_another_message(adapter: str) -> str:
+    """Return the message for an adapter another process already holds."""
+    return (
+        f"{adapter} is already held by another process; libcec allows only one "
+        "at a time, so stop the other user of this adapter first"
+    )
+
+
+def adapter_busy_message(adapter: str | None) -> str:
+    """Return the message for an adapter that never opened."""
+    return (
+        f"the CEC adapter {adapter or '(auto-detected)'} did not open within "
+        f"{OPEN_WAIT_SECONDS:.0f}s; another process most likely holds it — "
+        "libcec allows only one at a time"
+    )
 
 
 def import_cec() -> Any:
@@ -180,6 +281,8 @@ class SwigDriver(LibcecDriver):
         """Open the adapter, tolerating libcec's unreliable return value."""
         if self._lib is not None:
             return
+        if self._adapter and adapter_is_held(self._adapter):
+            raise DriverUnavailable(held_by_another_message(self._adapter))
         lib = self._configure()
         port = self._adapter
         if not port:
@@ -292,6 +395,9 @@ class PythonCecDriver(LibcecDriver):
         """Open the adapter for this process."""
         if self._opened:
             return
+        if self._adapter and adapter_is_held(self._adapter):
+            # Calling init() here would freeze the interpreter, not fail.
+            raise DriverUnavailable(held_by_another_message(self._adapter))
         try:
             if self._adapter:
                 self._cec.init(self._adapter)

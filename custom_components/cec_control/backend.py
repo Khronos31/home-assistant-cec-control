@@ -29,9 +29,12 @@ from .const import (
     OPCODE_USER_CONTROL_RELEASE,
 )
 from .libcec_driver import (
+    OPEN_WAIT_SECONDS,
     DriverError,
     DriverUnavailable,
     LibcecDriver,
+    OpenGuard,
+    adapter_busy_message,
     create_driver,
 )
 
@@ -156,6 +159,7 @@ class LocalBackend(CecBackend):
         self._adapter = adapter
         self._lock = asyncio.Lock()
         self._driver: LibcecDriver | None = None
+        self._guard = OpenGuard()
 
     @property
     def label(self) -> str:
@@ -169,9 +173,26 @@ class LocalBackend(CecBackend):
         return driver
 
     async def _async_driver(self) -> LibcecDriver:
-        """Return the open driver, opening it the first time."""
-        if self._driver is None:
-            self._driver = await self._hass.async_add_executor_job(self._open_sync)
+        """Return the open driver, bounding how long we wait for it.
+
+        Opening can block forever when another process already holds the
+        adapter, so this gives up rather than wedging Home Assistant's setup.
+        """
+        if self._driver is not None:
+            return self._driver
+        blocked = self._guard.blocked()
+        if blocked:
+            raise BackendUnavailable(blocked)
+        try:
+            self._driver = await asyncio.wait_for(
+                self._hass.async_add_executor_job(self._open_sync),
+                timeout=OPEN_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            message = adapter_busy_message(self._adapter)
+            self._guard.record_failure(message)
+            raise BackendUnavailable(message) from None
+        self._guard.record_success()
         return self._driver
 
     async def _call(self, method: str, *args: Any) -> Any:
