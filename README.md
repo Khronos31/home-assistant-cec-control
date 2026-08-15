@@ -99,6 +99,10 @@ The key table was lifted from
 [Khronos31/lua-remote-hub](https://github.com/Khronos31/lua-remote-hub), where
 it had already been verified against this television, and re-checked here.
 
+The icon is the `hdmi-port` glyph from
+[Material Design Icons](https://github.com/Templarian/MaterialDesign),
+Apache-2.0.
+
 ## License
 
 MIT.
